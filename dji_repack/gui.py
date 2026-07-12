@@ -13,6 +13,7 @@ import queue
 import shutil
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -236,9 +237,14 @@ class App:
             for group in groups:
                 if len(group.clips) < 2:
                     clip = group.clips[0]
-                    for w in copy_lone_clip(clip, dest_dir):
+                    start = time.perf_counter()
+                    copy_warnings = copy_lone_clip(clip, dest_dir)
+                    elapsed = time.perf_counter() - start
+                    for w in copy_warnings:
                         self.queue.put(("log", f"warning: {w}"))
-                    self.queue.put(("log", f"copied single clip -> {dest_dir / clip.mp4_path.name}"))
+                    self.queue.put((
+                        "log", f"copied single clip -> {dest_dir / clip.mp4_path.name} ({elapsed:.1f}s)",
+                    ))
                     self.queue.put(("merged_group", group))
                     continue
 
@@ -246,14 +252,18 @@ class App:
                 if gap_warning:
                     self.queue.put(("log", f"warning: {gap_warning}"))
 
+                start = time.perf_counter()
                 result = merge_group(group, dest_dir=dest_dir)
+                elapsed = time.perf_counter() - start
                 for w in result.warnings:
                     self.queue.put(("log", f"warning: {w}"))
                 if not result.ok:
-                    self.queue.put(("log", f"FAILED: {', '.join(result.source_files)} -- {result.error}"))
+                    self.queue.put((
+                        "log", f"FAILED: {', '.join(result.source_files)} -- {result.error} ({elapsed:.1f}s)",
+                    ))
                     continue
 
-                self.queue.put(("log", f"merged -> {result.output_path}"))
+                self.queue.put(("log", f"merged -> {result.output_path} ({elapsed:.1f}s)"))
                 if do_archive:
                     for w in archive_merged_group(group, dest_dir):
                         self.queue.put(("log", f"warning: {w}"))
@@ -261,7 +271,12 @@ class App:
 
             if do_stills:
                 stills = discover_stills(source_dir)
-                copied, skipped, still_warnings = copy_stills(stills, dest_dir)
+                copied, skipped, still_warnings = copy_stills(
+                    stills, dest_dir,
+                    on_progress=lambda name, elapsed: self.queue.put(
+                        ("log", f"  {name}: copied ({elapsed:.2f}s)"),
+                    ),
+                )
                 for w in still_warnings:
                     self.queue.put(("log", f"warning: {w}"))
                 self.queue.put(("log", f"stills: {copied} copied, {skipped} already present"))

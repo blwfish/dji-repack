@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from .archive import archive_merged_group, copy_lone_clip
@@ -83,9 +84,12 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         for i, group in enumerate(groups, 1):
             if len(group.clips) < 2:
                 clip = group.clips[0]
-                for w in copy_lone_clip(clip, dest_dir):
+                start = time.perf_counter()
+                copy_warnings = copy_lone_clip(clip, dest_dir)
+                elapsed = time.perf_counter() - start
+                for w in copy_warnings:
                     print(f"warning: {w}", file=sys.stderr)
-                print(f"group {i}: single clip, copied -> {dest_dir / clip.mp4_path.name}")
+                print(f"group {i}: single clip, copied -> {dest_dir / clip.mp4_path.name} ({elapsed:.1f}s)")
                 copied_lone += 1
                 continue
 
@@ -93,15 +97,17 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             if gap_warning:
                 print(f"warning: {gap_warning}", file=sys.stderr)
 
+            start = time.perf_counter()
             result = merge_group(group, dest_dir=dest_dir)
+            elapsed = time.perf_counter() - start
             for w in result.warnings:
                 print(f"warning: {w}", file=sys.stderr)
             if not result.ok:
-                print(f"group {i}: FAILED -- {result.error}", file=sys.stderr)
+                print(f"group {i}: FAILED -- {result.error} ({elapsed:.1f}s)", file=sys.stderr)
                 failed += 1
                 continue
 
-            print(f"group {i}: merged -> {result.output_path}")
+            print(f"group {i}: merged -> {result.output_path} ({elapsed:.1f}s)")
             merged += 1
             if not args.no_archive:
                 for w in archive_merged_group(group, dest_dir):
@@ -110,7 +116,9 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     copied_stills = skipped_stills = 0
     if not args.no_stills:
         stills = discover_stills(source_dir)
-        copied_stills, skipped_stills, still_warnings = copy_stills(stills, dest_dir)
+        copied_stills, skipped_stills, still_warnings = copy_stills(
+            stills, dest_dir, on_progress=lambda name, elapsed: print(f"  {name}: copied ({elapsed:.2f}s)"),
+        )
         for w in still_warnings:
             print(f"warning: {w}", file=sys.stderr)
 

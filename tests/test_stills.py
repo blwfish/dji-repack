@@ -103,3 +103,43 @@ class TestCopyStills:
 
         assert copied == 0
         assert skipped == 1
+
+
+class TestCopyStillsProgress:
+    def test_on_progress_called_once_per_copied_file_with_a_nonnegative_elapsed(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.dng").write_bytes(b"x")
+        (src / "b.jpg").write_bytes(b"x")
+
+        events = []
+        copy_stills(
+            discover_stills(src), tmp_path / "dest",
+            on_progress=lambda name, elapsed: events.append((name, elapsed)),
+        )
+
+        assert {name for name, _ in events} == {"a.dng", "b.jpg"}
+        assert all(elapsed >= 0.0 for _, elapsed in events)
+
+    def test_on_progress_not_called_for_a_skipped_file(self, tmp_path):
+        src = tmp_path / "src"
+        dest = tmp_path / "dest"
+        src.mkdir()
+        dest.mkdir()
+        (src / "a.dng").write_bytes(b"x")
+        (dest / "a.dng").write_bytes(b"already there")  # forces a skip, not a copy
+
+        events = []
+        copy_stills(discover_stills(src), dest, on_progress=lambda name, elapsed: events.append(name))
+
+        assert events == []
+
+    def test_on_progress_defaults_to_none_without_raising(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.dng").write_bytes(b"x")
+
+        copied, skipped, warnings = copy_stills(discover_stills(src), tmp_path / "dest")
+
+        assert copied == 1
+        assert warnings == []

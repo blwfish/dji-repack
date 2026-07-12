@@ -9,6 +9,8 @@ alongside the merged video output in the same destination folder.
 from __future__ import annotations
 
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .constants import RAW_SPLITS_DIRNAME
@@ -36,7 +38,9 @@ def discover_stills(source_dir: Path) -> list[Path]:
     return stills
 
 
-def copy_stills(stills: list[Path], dest_dir: Path) -> tuple[int, int, list[str]]:
+def copy_stills(
+    stills: list[Path], dest_dir: Path, on_progress: Callable[[str, float], None] | None = None,
+) -> tuple[int, int, list[str]]:
     """Copies each still into dest_dir (flat -- matches how merged video
     output and lone-clip copies already land flat in dest_dir, regardless
     of what subfolder the source came from). Never moves: stills aren't
@@ -46,6 +50,11 @@ def copy_stills(stills: list[Path], dest_dir: Path) -> tuple[int, int, list[str]
     A destination file that already exists is treated as already copied
     and skipped, not overwritten or compared -- a same-named file already
     there is presumed complete from a prior run.
+
+    on_progress, if given, is called once per still actually copied (not
+    for one skipped as already-present -- a skip isn't processing) with
+    (filename, elapsed_seconds), so a caller can report progress as it
+    happens instead of only the final aggregate count.
 
     Returns (copied_count, skipped_count, warnings)."""
     dest_dir = Path(dest_dir)
@@ -58,9 +67,13 @@ def copy_stills(stills: list[Path], dest_dir: Path) -> tuple[int, int, list[str]
         if dest_path.exists():
             skipped += 1
             continue
+        start = time.perf_counter()
         try:
             shutil.copy2(still, dest_path)
-            copied += 1
         except OSError as e:
             warnings.append(f"{still.name}: failed to copy -- {e}")
+            continue
+        copied += 1
+        if on_progress is not None:
+            on_progress(still.name, time.perf_counter() - start)
     return copied, skipped, warnings
