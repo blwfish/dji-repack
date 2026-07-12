@@ -7,8 +7,9 @@ import shutil
 import sys
 from pathlib import Path
 
-from .archive import archive_merged_group
+from .archive import archive_merged_group, copy_lone_clip
 from .procs import sweep_stale_partials
+from .stills import copy_stills, discover_stills
 from .video import (
     GAP_THRESHOLD_DEFAULT_S,
     discover_clips,
@@ -35,22 +36,26 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     groups = group_clips(clips, gap_threshold_s=args.gap_threshold)
     if not groups:
-        print("no clips found")
-        return 0
+        print("no video clips found")
+    else:
+        for i, group in enumerate(groups, 1):
+            summary = group_summary(group)
+            kind = "multi-clip, will merge" if summary["clip_count"] > 1 else "single clip, will be copied as-is"
+            print(f"group {i}: {summary['clip_count']} clip(s), {kind}")
+            print(f"  start: {summary['start_dt']}  duration: {summary['total_duration_s']:.1f}s"
+                  f"  size: {summary['total_size_bytes'] / 1e6:.1f} MB")
+            for name in summary["clip_names"]:
+                print(f"    {name}")
+            if summary["missing_srt"]:
+                print(f"  missing SRT: {', '.join(summary['missing_srt'])}")
+            gap_warning = group_part_index_gap_warning(group)
+            if gap_warning:
+                print(f"  warning: {gap_warning}")
 
-    for i, group in enumerate(groups, 1):
-        summary = group_summary(group)
-        kind = "multi-clip, will merge" if summary["clip_count"] > 1 else "single clip, nothing to merge"
-        print(f"group {i}: {summary['clip_count']} clip(s), {kind}")
-        print(f"  start: {summary['start_dt']}  duration: {summary['total_duration_s']:.1f}s"
-              f"  size: {summary['total_size_bytes'] / 1e6:.1f} MB")
-        for name in summary["clip_names"]:
-            print(f"    {name}")
-        if summary["missing_srt"]:
-            print(f"  missing SRT: {', '.join(summary['missing_srt'])}")
-        gap_warning = group_part_index_gap_warning(group)
-        if gap_warning:
-            print(f"  warning: {gap_warning}")
+    if not args.no_stills:
+        stills = discover_stills(source_dir)
+        print(f"{len(stills)} still image(s) found (.dng/.jpg/.jpeg)")
+
     return 0
 
 
@@ -66,35 +71,53 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     clips, warnings = discover_clips(source_dir)
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
-    if not clips:
-        print("no clips found")
-        return 0
 
-    groups = group_clips(clips, gap_threshold_s=args.gap_threshold)
     merged = 0
+    copied_lone = 0
     failed = 0
-    for i, group in enumerate(groups, 1):
-        if len(group.clips) < 2:
-            continue
-        gap_warning = group_part_index_gap_warning(group)
-        if gap_warning:
-            print(f"warning: {gap_warning}", file=sys.stderr)
 
-        result = merge_group(group, dest_dir=dest_dir)
-        for w in result.warnings:
-            print(f"warning: {w}", file=sys.stderr)
-        if not result.ok:
-            print(f"group {i}: FAILED -- {result.error}", file=sys.stderr)
-            failed += 1
-            continue
+    if not clips:
+        print("no video clips found")
+    else:
+        groups = group_clips(clips, gap_threshold_s=args.gap_threshold)
+        for i, group in enumerate(groups, 1):
+            if len(group.clips) < 2:
+                clip = group.clips[0]
+                for w in copy_lone_clip(clip, dest_dir):
+                    print(f"warning: {w}", file=sys.stderr)
+                print(f"group {i}: single clip, copied -> {dest_dir / clip.mp4_path.name}")
+                copied_lone += 1
+                continue
 
-        print(f"group {i}: merged -> {result.output_path}")
-        merged += 1
-        if not args.no_archive:
-            for w in archive_merged_group(group, dest_dir):
+            gap_warning = group_part_index_gap_warning(group)
+            if gap_warning:
+                print(f"warning: {gap_warning}", file=sys.stderr)
+
+            result = merge_group(group, dest_dir=dest_dir)
+            for w in result.warnings:
                 print(f"warning: {w}", file=sys.stderr)
+            if not result.ok:
+                print(f"group {i}: FAILED -- {result.error}", file=sys.stderr)
+                failed += 1
+                continue
 
-    print(f"done: {merged} merged, {failed} failed")
+            print(f"group {i}: merged -> {result.output_path}")
+            merged += 1
+            if not args.no_archive:
+                for w in archive_merged_group(group, dest_dir):
+                    print(f"warning: {w}", file=sys.stderr)
+
+    copied_stills = skipped_stills = 0
+    if not args.no_stills:
+        stills = discover_stills(source_dir)
+        copied_stills, skipped_stills, still_warnings = copy_stills(stills, dest_dir)
+        for w in still_warnings:
+            print(f"warning: {w}", file=sys.stderr)
+
+    summary = f"done: {merged} merged, {copied_lone} single clip(s) copied, {failed} failed"
+    if not args.no_stills:
+        summary += f", {copied_stills} still(s) copied ({skipped_stills} already present)"
+    print(summary)
     return 1 if failed else 0
 
 
@@ -108,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--gap-threshold", type=float, default=GAP_THRESHOLD_DEFAULT_S,
         help=f"seconds between clips to still count as the same recording (default {GAP_THRESHOLD_DEFAULT_S:.0f})",
     )
+    scan.add_argument(
+        "--no-stills", action="store_true",
+        help="don't report on still images (.dng/.jpg/.jpeg) found in source_dir",
+    )
     scan.set_defaults(func=_cmd_scan)
 
     merge = sub.add_parser("merge", help="Discover, group, merge, and archive split clips")
@@ -120,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument(
         "--no-archive", action="store_true",
         help="leave merged source clips in place instead of moving them to _raw_splits/",
+    )
+    merge.add_argument(
+        "--no-stills", action="store_true",
+        help="don't copy still images (.dng/.jpg/.jpeg) from source_dir to --dest",
     )
     merge.set_defaults(func=_cmd_merge)
 

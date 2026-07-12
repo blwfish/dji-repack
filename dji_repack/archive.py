@@ -6,10 +6,11 @@ decoupled from Corpus/photos_dir -- here it just takes a plain dest_dir.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from .constants import RAW_SPLITS_DIRNAME
-from .video import ClipGroup
+from .video import Clip, ClipGroup
 
 
 def archive_merged_group(group: ClipGroup, dest_dir: Path) -> list[str]:
@@ -45,4 +46,36 @@ def archive_merged_group(group: ClipGroup, dest_dir: Path) -> list[str]:
             f"source folder -- a future rerun may rediscover them as a stray "
             f"single-clip group ({'; '.join(failures)})"
         )
+    return warnings
+
+
+def copy_lone_clip(clip: Clip, dest_dir: Path) -> list[str]:
+    """A group of one clip is already a complete recording -- there's
+    nothing for merge_group to concatenate -- but if dest_dir is a
+    different folder than where the clip lives (e.g. merging straight off
+    a card to local disk), it still needs to land at the destination like
+    every other clip does. Copies (never moves -- unlike
+    archive_merged_group, there's no merged replacement consuming this
+    clip, so the source is never touched) the .MP4 and its .SRT sidecar,
+    if any, into dest_dir as-is, preserving the original filename.
+
+    A destination file that already exists (including the in-place case,
+    dest_dir == the clip's own folder, where source and destination are
+    literally the same file) is treated as already there and skipped, not
+    overwritten or compared -- same idempotent-rerun convention as
+    copy_stills.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    warnings = []
+    for src in (clip.mp4_path, clip.srt_path):
+        if src is None or not src.exists():
+            continue
+        dest_path = dest_dir / src.name
+        if dest_path.exists():
+            continue
+        try:
+            shutil.copy2(src, dest_path)
+        except OSError as e:
+            warnings.append(f"{src.name}: failed to copy -- {e}")
     return warnings

@@ -17,8 +17,9 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .archive import archive_merged_group
+from .archive import archive_merged_group, copy_lone_clip
 from .procs import sweep_stale_partials
+from .stills import copy_stills, discover_stills
 from .video import (
     GAP_THRESHOLD_DEFAULT_S,
     ClipGroup,
@@ -34,7 +35,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("DJI Repack")
-        root.geometry("880x560")
+        root.geometry("880x600")
 
         self.groups: list[ClipGroup] = []
         self.queue: queue.Queue = queue.Queue()
@@ -50,17 +51,30 @@ class App:
         ttk.Label(top, text="Source folder:").grid(row=0, column=0, sticky="w")
         self.source_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.source_var, width=60).grid(row=0, column=1, sticky="we", padx=4)
-        ttk.Button(top, text="Browse...", command=self._browse).grid(row=0, column=2)
+        ttk.Button(top, text="Browse...", command=self._browse_source).grid(row=0, column=2)
+
+        ttk.Label(top, text="Destination folder:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.dest_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.dest_var, width=60).grid(row=1, column=1, sticky="we", padx=4, pady=(4, 0))
+        ttk.Button(top, text="Browse...", command=self._browse_dest).grid(row=1, column=2, pady=(4, 0))
+        ttk.Label(top, text="(leave blank to merge in place, same as source)", foreground="#666").grid(
+            row=2, column=1, sticky="w",
+        )
         top.columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="Gap threshold (s):").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="Gap threshold (s):").grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.gap_var = tk.StringVar(value=str(int(GAP_THRESHOLD_DEFAULT_S)))
-        ttk.Entry(top, textvariable=self.gap_var, width=10).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Entry(top, textvariable=self.gap_var, width=10).grid(row=3, column=1, sticky="w", pady=(4, 0))
 
         self.archive_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             top, text="Archive merged source clips to _raw_splits/", variable=self.archive_var,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.stills_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top, text="Also copy still images (.dng/.jpg/.jpeg) to the destination", variable=self.stills_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
 
         btns = ttk.Frame(self.root, padding=(8, 0))
         btns.pack(fill="x")
@@ -100,10 +114,15 @@ class App:
         self.log = tk.Text(log_frame, height=10, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
 
-    def _browse(self) -> None:
+    def _browse_source(self) -> None:
         path = filedialog.askdirectory()
         if path:
             self.source_var.set(path)
+
+    def _browse_dest(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.dest_var.set(path)
 
     def _log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -135,6 +154,10 @@ class App:
             messagebox.showerror("dji-repack", f"Not a folder: {path}")
             return None
         return path
+
+    def _dest_dir(self, source_dir: Path) -> Path:
+        raw = self.dest_var.get().strip()
+        return Path(raw) if raw else source_dir
 
     def _check_ffmpeg(self) -> bool:
         missing = [name for name in ("ffmpeg", "ffprobe") if shutil.which(name) is None]
@@ -169,7 +192,8 @@ class App:
         try:
             clips, warnings = discover_clips(source_dir)
             groups = group_clips(clips, gap_threshold_s=gap_threshold)
-            self.queue.put(("scan_done", groups, warnings))
+            stills = discover_stills(source_dir)
+            self.queue.put(("scan_done", groups, warnings, len(stills)))
         except Exception as e:  # noqa: BLE001 -- surfaced to the log, not swallowed
             self.queue.put(("error", str(e)))
 
@@ -189,22 +213,35 @@ class App:
         source_dir = self._source_dir()
         if source_dir is None:
             return
-        groups = [self.groups[i] for i in indices if len(self.groups[i].clips) > 1]
+        dest_dir = self._dest_dir(source_dir)
+        groups = [self.groups[i] for i in indices]
         if not groups:
-            messagebox.showinfo("dji-repack", "Nothing to merge (only single-clip groups selected).")
+            messagebox.showinfo("dji-repack", "Nothing selected.")
             return
         self._set_busy(True)
         threading.Thread(
-            target=self._merge_worker, args=(groups, source_dir, self.archive_var.get()), daemon=True,
+            target=self._merge_worker,
+            args=(groups, source_dir, dest_dir, self.archive_var.get(), self.stills_var.get()),
+            daemon=True,
         ).start()
 
-    def _merge_worker(self, groups: list[ClipGroup], dest_dir: Path, do_archive: bool) -> None:
+    def _merge_worker(
+        self, groups: list[ClipGroup], source_dir: Path, dest_dir: Path, do_archive: bool, do_stills: bool,
+    ) -> None:
         try:
             swept = sweep_stale_partials(dest_dir)
             for name in swept:
                 self.queue.put(("log", f"removed leftover partial: {name}"))
 
             for group in groups:
+                if len(group.clips) < 2:
+                    clip = group.clips[0]
+                    for w in copy_lone_clip(clip, dest_dir):
+                        self.queue.put(("log", f"warning: {w}"))
+                    self.queue.put(("log", f"copied single clip -> {dest_dir / clip.mp4_path.name}"))
+                    self.queue.put(("merged_group", group))
+                    continue
+
                 gap_warning = group_part_index_gap_warning(group)
                 if gap_warning:
                     self.queue.put(("log", f"warning: {gap_warning}"))
@@ -222,6 +259,13 @@ class App:
                         self.queue.put(("log", f"warning: {w}"))
                 self.queue.put(("merged_group", group))
 
+            if do_stills:
+                stills = discover_stills(source_dir)
+                copied, skipped, still_warnings = copy_stills(stills, dest_dir)
+                for w in still_warnings:
+                    self.queue.put(("log", f"warning: {w}"))
+                self.queue.put(("log", f"stills: {copied} copied, {skipped} already present"))
+
             self.queue.put(("merge_done", None))
         except Exception as e:  # noqa: BLE001 -- surfaced to the log, not swallowed
             self.queue.put(("error", str(e)))
@@ -231,12 +275,12 @@ class App:
             while True:
                 kind, *payload = self.queue.get_nowait()
                 if kind == "scan_done":
-                    groups, warnings = payload
+                    groups, warnings, still_count = payload
                     self.groups = groups
                     for w in warnings:
                         self._log(f"warning: {w}")
                     self._populate_tree()
-                    self._log(f"found {len(groups)} group(s)")
+                    self._log(f"found {len(groups)} group(s), {still_count} still image(s)")
                     self._set_busy(False)
                 elif kind == "merged_group":
                     (group,) = payload
@@ -262,6 +306,8 @@ class App:
         for group in self.groups:
             summary = group_summary(group)
             warnings = []
+            if summary["clip_count"] == 1:
+                warnings.append("single clip, will be copied as-is")
             if summary["missing_srt"]:
                 warnings.append(f"missing SRT: {', '.join(summary['missing_srt'])}")
             gap_warning = group_part_index_gap_warning(group)

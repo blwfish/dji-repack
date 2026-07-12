@@ -7,9 +7,10 @@ Extracted from mneme's core/repack/ so it can run standalone, without the
 rest of mneme, while still using Lightroom day to day.
 """
 
-from .archive import archive_merged_group
+from .archive import archive_merged_group, copy_lone_clip
 from .constants import RAW_SPLITS_DIRNAME
 from .srt_parser import SrtCue, SrtParseError, format_cue_block, parse_srt
+from .stills import STILL_EXTENSIONS, copy_stills, discover_stills
 from .video import (
     GAP_THRESHOLD_DEFAULT_S,
     Clip,
@@ -30,6 +31,10 @@ __all__ = [
     "merge_group",
     "group_summary",
     "archive_merged_group",
+    "copy_lone_clip",
+    "discover_stills",
+    "copy_stills",
+    "STILL_EXTENSIONS",
     "Clip",
     "ClipGroup",
     "ClipProbe",

@@ -1,8 +1,8 @@
-"""Tests for dji_repack.archive.archive_merged_group."""
+"""Tests for dji_repack.archive.archive_merged_group and copy_lone_clip."""
 
 from datetime import datetime
 
-from dji_repack.archive import archive_merged_group
+from dji_repack.archive import archive_merged_group, copy_lone_clip
 from dji_repack.constants import RAW_SPLITS_DIRNAME
 from dji_repack.video import Clip, ClipGroup, ClipProbe
 
@@ -83,3 +83,88 @@ class TestArchiveMergedGroup:
         assert mp4_b.exists()  # left in place, since the rename failed
         assert len(warnings) == 1
         assert "b.MP4" in warnings[0]
+
+
+class TestCopyLoneClip:
+    def test_copies_mp4_and_srt_to_a_different_dest(self, tmp_path):
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        mp4 = src_dir / "DJI_20260629100000_0001.MP4"
+        srt = src_dir / "DJI_20260629100000_0001.SRT"
+        mp4.write_bytes(b"video")
+        srt.write_text("telemetry")
+
+        warnings = copy_lone_clip(make_clip(mp4, srt), dest_dir)
+
+        assert warnings == []
+        assert (dest_dir / mp4.name).read_bytes() == b"video"
+        assert (dest_dir / srt.name).read_text() == "telemetry"
+        # source is untouched -- a lone clip is copied, never moved
+        assert mp4.exists()
+        assert srt.exists()
+
+    def test_clip_with_no_srt_copies_only_the_mp4(self, tmp_path):
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        mp4 = src_dir / "DJI_20260629100000_0001.MP4"
+        mp4.write_bytes(b"video")
+
+        warnings = copy_lone_clip(make_clip(mp4), dest_dir)
+
+        assert warnings == []
+        assert (dest_dir / mp4.name).exists()
+        assert list(dest_dir.iterdir()) == [dest_dir / mp4.name]
+
+    def test_in_place_merge_where_dest_equals_source_is_a_safe_no_op(self, tmp_path):
+        # dest_dir == the clip's own folder: the "destination" file IS the
+        # source file, so this must not raise shutil.SameFileError or
+        # otherwise touch it.
+        mp4 = tmp_path / "DJI_20260629100000_0001.MP4"
+        mp4.write_bytes(b"video")
+
+        warnings = copy_lone_clip(make_clip(mp4), tmp_path)
+
+        assert warnings == []
+        assert mp4.read_bytes() == b"video"
+
+    def test_preexisting_file_at_dest_is_skipped_not_overwritten(self, tmp_path):
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        dest_dir.mkdir()
+        mp4 = src_dir / "DJI_20260629100000_0001.MP4"
+        mp4.write_bytes(b"new content")
+        (dest_dir / mp4.name).write_bytes(b"already there")
+
+        warnings = copy_lone_clip(make_clip(mp4), dest_dir)
+
+        assert warnings == []
+        assert (dest_dir / mp4.name).read_bytes() == b"already there"
+
+    def test_does_not_archive_into_raw_splits(self, tmp_path):
+        # A lone clip was never merged into anything -- it must land at
+        # dest_dir's top level, not get tucked into _raw_splits/ the way a
+        # successfully-merged group's originals do.
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "dest"
+        src_dir.mkdir()
+        mp4 = src_dir / "DJI_20260629100000_0001.MP4"
+        mp4.write_bytes(b"video")
+
+        copy_lone_clip(make_clip(mp4), dest_dir)
+
+        assert not (dest_dir / RAW_SPLITS_DIRNAME).exists()
+        assert (dest_dir / mp4.name).exists()
+
+    def test_creates_dest_dir_if_missing(self, tmp_path):
+        src_dir = tmp_path / "src"
+        dest_dir = tmp_path / "does" / "not" / "exist"
+        src_dir.mkdir()
+        mp4 = src_dir / "DJI_20260629100000_0001.MP4"
+        mp4.write_bytes(b"video")
+
+        copy_lone_clip(make_clip(mp4), dest_dir)
+
+        assert (dest_dir / mp4.name).exists()
