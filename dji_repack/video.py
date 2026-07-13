@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import procs
-from .constants import RAW_SPLITS_DIRNAME
+from .constants import is_within_raw_splits
 from .srt_parser import SrtCue, SrtParseError, format_cue_block, parse_srt
 
 FFPROBE = "ffprobe"
@@ -41,6 +41,16 @@ _quote_concat_path = procs.quote_concat_path
 _next_available_path = procs.next_available_path
 
 GAP_THRESHOLD_DEFAULT_S = 300.0
+
+# This tool's own merged-output filename prefix (see merge_group's
+# out_path construction below) -- also used by discover_clips to
+# explicitly skip re-ingesting a previous run's own output on a rerun.
+# Single source of truth for both: previously the skip was only an
+# implicit side effect of FILENAME_TS_RE requiring a "DJI_" prefix (which
+# "AIR3_" never matches), an undocumented, untested coincidence between
+# two independently-chosen filename conventions rather than an explicit
+# contract.
+MERGED_OUTPUT_PREFIX = "AIR3_"
 
 FILENAME_TS_RE = re.compile(r"DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})_")
 
@@ -307,6 +317,23 @@ def _filename_part_index(mp4_path: Path) -> int | None:
     return int(idx_m.group(1)) if idx_m else None
 
 
+def _clip_sort_key(c: Clip) -> tuple:
+    """Sort key for discover_clips's final ordering: wall-clock start
+    time, then filename_suffix (populated only on the cueless/filename-
+    estimated path) as a same-second tiebreaker, then the full source
+    path as a final deterministic tiebreaker. Two SRT-timed clips that
+    happen to share an identical wall-clock start second (filename_suffix
+    is None -> "" for both, since it's never populated on the cued path)
+    would otherwise tie all the way through this key and fall back to
+    whatever order Python's stable sort happened to preserve from the
+    earlier path-lexicographic pass over mp4_paths -- which worked, but
+    was an unlabeled accident of sort stability rather than an explicit,
+    tested contract. Making the path an explicit third key element
+    documents the actual tiebreak behavior instead of relying on it
+    silently."""
+    return (c.start_dt, c.filename_suffix or "", str(c.mp4_path))
+
+
 def discover_clips(source_dir: Path) -> tuple[list[Clip], list[str]]:
     """Returns (clips sorted by wall-clock start time, list of warning strings)."""
     warnings: list[str] = []
@@ -316,7 +343,7 @@ def discover_clips(source_dir: Path) -> tuple[list[Clip], list[str]]:
         # and archived -- rediscovering them here would re-merge already-
         # processed footage into a duplicate output on every rerun (e.g.
         # after a crash mid-import on a reused staging dir).
-        if RAW_SPLITS_DIRNAME in p.relative_to(source_dir).parts[:-1]:
+        if is_within_raw_splits(p, source_dir):
             continue
         try:
             is_mp4 = p.is_file() and p.suffix.lower() == ".mp4"
@@ -325,6 +352,11 @@ def discover_clips(source_dir: Path) -> tuple[list[Clip], list[str]]:
             # abort discovery of the entire source directory -- same
             # discipline as the per-clip probe failures caught below.
             warnings.append(f"{p.name}: skipped during scan -- {e}")
+            continue
+        if is_mp4 and p.name.startswith(MERGED_OUTPUT_PREFIX):
+            # This tool's own merged output -- see MERGED_OUTPUT_PREFIX's
+            # own docstring for why this is now an explicit check rather
+            # than an implicit side effect of FILENAME_TS_RE.
             continue
         if is_mp4:
             mp4_paths.append(p)
@@ -384,7 +416,7 @@ def discover_clips(source_dir: Path) -> tuple[list[Clip], list[str]]:
             part_index=_filename_part_index(mp4_path),
         ))
 
-    clips.sort(key=lambda c: (c.start_dt, c.filename_suffix or ""))
+    clips.sort(key=_clip_sort_key)
     return clips, warnings
 
 
@@ -449,11 +481,27 @@ def _last_gps_cue(clips: list[Clip]) -> SrtCue | None:
     return None
 
 
+def _clip_size_or_none(clip: Clip) -> int | None:
+    try:
+        return clip.mp4_path.stat().st_size
+    except OSError:
+        return None
+
+
 def group_summary(group: ClipGroup) -> dict:
     clips = group.clips
     first, last = clips[0], clips[-1]
     total_duration = sum(c.probe.duration_s for c in clips)
-    total_size = sum(c.mp4_path.stat().st_size for c in clips)
+    # Unlike every other filesystem touch in this codebase (discover_clips,
+    # archive_merged_group, copy_lone_clip, copy_stills), this used to be
+    # an unguarded stat() -- group_summary can run well after discovery
+    # completed (e.g. the GUI calls it again on tree-selection/populate),
+    # so a file removed, ejected, or renamed in that window crashed the
+    # whole scan/GUI-populate call instead of degrading like every
+    # analogous failure elsewhere in this package.
+    sizes = [_clip_size_or_none(c) for c in clips]
+    total_size = sum(s for s in sizes if s is not None)
+    size_unavailable = any(s is None for s in sizes)
     start_cue = _first_gps_cue(clips)
     end_cue = _last_gps_cue(clips)
     start_loc = (start_cue.latitude, start_cue.longitude) if start_cue else None
@@ -476,6 +524,7 @@ def group_summary(group: ClipGroup) -> dict:
         "start_is_estimated": first.start_is_estimated,
         "missing_srt": [c.mp4_path.name for c in clips if c.srt_error],
         "gap_to_next_s": group.gap_to_next_s,
+        "size_unavailable": size_unavailable,
     }
 
 
@@ -568,7 +617,9 @@ def merge_group(group: ClipGroup, dest_dir: Path) -> MergeResult:
     first = clips[0]
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    out_path = _next_available_path(dest_dir / f"AIR3_{first.start_dt.strftime('%Y%m%d_%H%M%S')}.mp4")
+    out_path = _next_available_path(
+        dest_dir / f"{MERGED_OUTPUT_PREFIX}{first.start_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
+    )
     # ffmpeg writes to a hidden .partial name and we rename on success only,
     # so a mid-run failure (disk full, killed, decode error) never leaves a
     # broken file sitting at the real output name -- indistinguishable from
@@ -592,8 +643,27 @@ def merge_group(group: ClipGroup, dest_dir: Path) -> MergeResult:
         # on success, which would drown out genuine non-fatal warnings
         # (e.g. timestamp discontinuities) in the warnings list surfaced
         # to the caller.
-        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "warning",
-               "-f", "concat", "-safe", "0", "-i", str(concat_list)]
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "warning"]
+
+        if first.probe.rotation:
+            # Must precede this input's own -i: -display_rotation is a
+            # per-input decoder option, not an output-side -metadata key.
+            # An output-side `-metadata:s:v:0 rotate=...` on a stream-copy
+            # mux (the previous approach) is a silent no-op on ffmpeg
+            # 8.1.1's mov/mp4 muxer -- confirmed by direct reproduction
+            # (plain remux and this exact concat-demuxer command shape,
+            # both rotate=90 and rotate=-90): no Display Matrix side_data
+            # and no rotate tag ever land in the output, so a merge of
+            # rotated (e.g. portrait-mode) source clips reported
+            # ok=True with no warnings while silently losing all
+            # orientation metadata -- it played back sideways in every
+            # player. -display_rotation, placed before this concat
+            # demuxer input, was verified (same ffmpeg version, same
+            # command shape, positive and negative rotation) to produce
+            # a correct Display Matrix side_data entry in the output.
+            cmd += ["-display_rotation", str(first.probe.rotation)]
+
+        cmd += ["-f", "concat", "-safe", "0", "-i", str(concat_list)]
 
         if merged_srt_text is not None:
             merged_srt = tmp_path / "merged.srt"
@@ -618,13 +688,6 @@ def merge_group(group: ClipGroup, dest_dir: Path) -> MergeResult:
             cmd += ["-c:a", "copy"]
         if merged_srt_text is not None:
             cmd += ["-c:s", "mov_text", "-metadata:s:s:0", "handler_name=Air3 Telemetry"]
-
-        if first.probe.rotation:
-            # ffmpeg's concat demuxer + stream copy doesn't reliably
-            # propagate source rotation side data/tags across the concat
-            # boundary; set it explicitly on the output video stream so
-            # playback orientation isn't silently lost or corrupted.
-            cmd += ["-metadata:s:v:0", f"rotate={first.probe.rotation}"]
 
         if first.probe.creation_time:
             cmd += ["-metadata", f"creation_time={first.probe.creation_time}"]

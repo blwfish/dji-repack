@@ -13,29 +13,42 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .constants import RAW_SPLITS_DIRNAME
+from .constants import is_within_raw_splits
 
 STILL_EXTENSIONS = frozenset({".dng", ".jpg", ".jpeg"})
 
 
-def discover_stills(source_dir: Path) -> list[Path]:
+def discover_stills(source_dir: Path) -> tuple[list[Path], list[str]]:
     """Every still-image file under source_dir, recursively, excluding
     _raw_splits/ (same convention as video.discover_clips -- that
     directory holds already-processed video sources, never scanned back
-    into)."""
+    into).
+
+    Returns (stills sorted by path, list of warning strings) -- matching
+    video.discover_clips's own (clips, warnings) return shape. Previously
+    this returned only a bare list and a per-file scan error (broken
+    symlink, permission denied) was swallowed by a bare `continue` with no
+    warnings channel at all: unlike the structurally identical scan loop
+    in discover_clips, a still image dropped here was invisible -- not
+    counted, not logged, indistinguishable from "there was no such file."
+    Real photo/video content silently missing with no diagnostic trail is
+    exactly the failure mode this return value now closes off.
+    """
     source_dir = Path(source_dir)
     stills = []
+    warnings: list[str] = []
     for p in source_dir.rglob("*"):
-        if RAW_SPLITS_DIRNAME in p.relative_to(source_dir).parts[:-1]:
+        if is_within_raw_splits(p, source_dir):
             continue
         try:
             is_still = p.is_file() and p.suffix.lower() in STILL_EXTENSIONS
-        except OSError:
+        except OSError as e:
+            warnings.append(f"{p.name}: skipped during scan -- {e}")
             continue
         if is_still:
             stills.append(p)
     stills.sort()
-    return stills
+    return stills, warnings
 
 
 def copy_stills(

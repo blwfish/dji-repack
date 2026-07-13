@@ -3,9 +3,76 @@
 Ported from mneme's tests/test_repack_procs.py.
 """
 
+from pathlib import Path
+
 import pytest
 
 from dji_repack import procs
+
+
+class TestSweepStalePartials:
+    """The HIGH gap: zero test coverage anywhere in the suite for the
+    stale-`.partial` cleanup this package's own merge failure path
+    depends on to not leak temp files across crashed runs."""
+
+    def test_removes_matching_partial_files(self, tmp_path):
+        stale = tmp_path / ".AIR3_20260629_100000.partial.mp4"
+        stale.write_bytes(b"x")
+        removed, failures = procs.sweep_stale_partials(tmp_path)
+        assert removed == [stale.name]
+        assert failures == []
+        assert not stale.exists()
+
+    def test_ignores_non_partial_files(self, tmp_path):
+        keep = tmp_path / "AIR3_20260629_100000.mp4"
+        keep.write_bytes(b"x")
+        removed, failures = procs.sweep_stale_partials(tmp_path)
+        assert removed == []
+        assert failures == []
+        assert keep.exists()
+
+    def test_empty_dir_returns_empty_lists(self, tmp_path):
+        assert procs.sweep_stale_partials(tmp_path) == ([], [])
+
+    def test_ignores_directories_matching_the_glob(self, tmp_path):
+        # A directory that happens to match the glob pattern must not be
+        # unlink()'d (which would raise IsADirectoryError) -- the
+        # `path.is_file()` guard exists precisely for this.
+        (tmp_path / ".weird.partial.dir").mkdir()
+        removed, failures = procs.sweep_stale_partials(tmp_path)
+        assert removed == []
+        assert failures == []
+
+    def test_multiple_stale_partials_all_removed(self, tmp_path):
+        a = tmp_path / ".AIR3_20260629_100000.partial.mp4"
+        b = tmp_path / ".AIR3_20260629_110000.partial.mp4"
+        a.write_bytes(b"x")
+        b.write_bytes(b"x")
+        removed, failures = procs.sweep_stale_partials(tmp_path)
+        assert set(removed) == {a.name, b.name}
+        assert failures == []
+
+    def test_failed_unlink_is_recorded_not_silently_dropped(self, tmp_path, monkeypatch):
+        """The LOW inventory regression: a file that failed to delete was
+        neither added to `removed` nor recorded anywhere else, so the
+        caller had no way to know cleanup silently failed for a given
+        `.partial` file -- now returned as a parallel `failures` list."""
+        stale = tmp_path / ".AIR3_20260629_100000.partial.mp4"
+        stale.write_bytes(b"x")
+
+        real_unlink = Path.unlink
+
+        def flaky_unlink(self, *a, **kw):
+            if self.name == stale.name:
+                raise OSError("permission denied")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+        removed, failures = procs.sweep_stale_partials(tmp_path)
+        assert removed == []
+        assert len(failures) == 1
+        assert stale.name in failures[0]
 
 
 class TestCountSkipped:

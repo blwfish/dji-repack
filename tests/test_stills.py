@@ -1,6 +1,8 @@
 """Tests for dji_repack.stills -- discovering and copying still images
 alongside video consolidation."""
 
+from pathlib import Path
+
 from dji_repack.constants import RAW_SPLITS_DIRNAME
 from dji_repack.stills import copy_stills, discover_stills
 
@@ -13,27 +15,61 @@ class TestDiscoverStills:
         (tmp_path / "d.mp4").write_bytes(b"x")  # not a still
         (tmp_path / "e.SRT").write_text("x")  # not a still
 
-        found = {p.name for p in discover_stills(tmp_path)}
-        assert found == {"a.DNG", "b.jpg", "c.JPEG"}
+        found, warnings = discover_stills(tmp_path)
+        assert {p.name for p in found} == {"a.DNG", "b.jpg", "c.JPEG"}
+        assert warnings == []
 
     def test_recurses_into_subfolders(self, tmp_path):
         nested = tmp_path / "100MEDIA"
         nested.mkdir()
         (nested / "a.dng").write_bytes(b"x")
 
-        found = discover_stills(tmp_path)
+        found, warnings = discover_stills(tmp_path)
         assert len(found) == 1
         assert found[0] == nested / "a.dng"
+        assert warnings == []
 
     def test_skips_raw_splits_directory(self, tmp_path):
         raw_splits = tmp_path / RAW_SPLITS_DIRNAME
         raw_splits.mkdir()
         (raw_splits / "a.dng").write_bytes(b"x")
 
-        assert discover_stills(tmp_path) == []
+        found, warnings = discover_stills(tmp_path)
+        assert found == []
+        assert warnings == []
 
     def test_empty_dir_returns_empty_list(self, tmp_path):
-        assert discover_stills(tmp_path) == []
+        found, warnings = discover_stills(tmp_path)
+        assert found == []
+        assert warnings == []
+
+
+class TestDiscoverStillsScanErrors:
+    def test_per_file_stat_error_is_warned_not_silently_dropped(self, tmp_path, monkeypatch):
+        """The HIGH regression: discover_stills used to swallow a
+        per-file OSError (broken symlink, permission denied) with a bare
+        `continue` and no warnings channel at all -- unlike
+        video.discover_clips's structurally identical scan loop, which
+        returns a warning for the same failure. A still image dropped
+        here used to be invisible: not counted, not logged,
+        indistinguishable from "there was no such file."."""
+        (tmp_path / "a.dng").write_bytes(b"x")
+        bad = tmp_path / "bad.dng"
+        bad.write_bytes(b"x")
+
+        real_is_file = Path.is_file
+
+        def flaky_is_file(self):
+            if self.name == "bad.dng":
+                raise OSError("permission denied")
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", flaky_is_file)
+
+        found, warnings = discover_stills(tmp_path)
+
+        assert [p.name for p in found] == ["a.dng"]
+        assert any("bad.dng" in w for w in warnings)
 
 
 class TestCopyStills:
@@ -44,7 +80,8 @@ class TestCopyStills:
         (src / "a.dng").write_bytes(b"raw data")
         (src / "b.jpg").write_bytes(b"jpeg data")
 
-        copied, skipped, warnings = copy_stills(discover_stills(src), dest)
+        found, _ = discover_stills(src)
+        copied, skipped, warnings = copy_stills(found, dest)
 
         assert copied == 2
         assert skipped == 0
@@ -60,7 +97,8 @@ class TestCopyStills:
         src.mkdir()
         (src / "a.dng").write_bytes(b"x")
 
-        copy_stills(discover_stills(src), dest)
+        found, _ = discover_stills(src)
+        copy_stills(found, dest)
 
         assert dest.is_dir()
         assert (dest / "a.dng").exists()
@@ -73,7 +111,8 @@ class TestCopyStills:
         (src / "a.dng").write_bytes(b"new content")
         (dest / "a.dng").write_bytes(b"already there")
 
-        copied, skipped, warnings = copy_stills(discover_stills(src), dest)
+        found, _ = discover_stills(src)
+        copied, skipped, warnings = copy_stills(found, dest)
 
         assert copied == 0
         assert skipped == 1
@@ -86,7 +125,8 @@ class TestCopyStills:
         nested.mkdir(parents=True)
         (nested / "a.dng").write_bytes(b"x")
 
-        copy_stills(discover_stills(src), dest)
+        found, _ = discover_stills(src)
+        copy_stills(found, dest)
 
         assert (dest / "a.dng").exists()
         assert not (dest / "100MEDIA").exists()
@@ -97,7 +137,7 @@ class TestCopyStills:
         src.mkdir()
         (src / "a.dng").write_bytes(b"x")
 
-        stills = discover_stills(src)
+        stills, _ = discover_stills(src)
         copy_stills(stills, dest)
         copied, skipped, _ = copy_stills(stills, dest)
 
@@ -113,8 +153,9 @@ class TestCopyStillsProgress:
         (src / "b.jpg").write_bytes(b"x")
 
         events = []
+        found, _ = discover_stills(src)
         copy_stills(
-            discover_stills(src), tmp_path / "dest",
+            found, tmp_path / "dest",
             on_progress=lambda name, elapsed: events.append((name, elapsed)),
         )
 
@@ -130,7 +171,8 @@ class TestCopyStillsProgress:
         (dest / "a.dng").write_bytes(b"already there")  # forces a skip, not a copy
 
         events = []
-        copy_stills(discover_stills(src), dest, on_progress=lambda name, elapsed: events.append(name))
+        found, _ = discover_stills(src)
+        copy_stills(found, dest, on_progress=lambda name, elapsed: events.append(name))
 
         assert events == []
 
@@ -139,7 +181,8 @@ class TestCopyStillsProgress:
         src.mkdir()
         (src / "a.dng").write_bytes(b"x")
 
-        copied, skipped, warnings = copy_stills(discover_stills(src), tmp_path / "dest")
+        found, _ = discover_stills(src)
+        copied, skipped, warnings = copy_stills(found, tmp_path / "dest")
 
         assert copied == 1
         assert warnings == []

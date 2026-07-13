@@ -13,23 +13,13 @@ import queue
 import shutil
 import sys
 import threading
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .archive import archive_merged_group, copy_lone_clip
-from .procs import sweep_stale_partials
-from .stills import copy_stills, discover_stills
-from .video import (
-    GAP_THRESHOLD_DEFAULT_S,
-    ClipGroup,
-    discover_clips,
-    group_clips,
-    group_part_index_gap_warning,
-    group_summary,
-    merge_group,
-)
+from .pipeline import run_merge_pipeline
+from .stills import discover_stills
+from .video import GAP_THRESHOLD_DEFAULT_S, ClipGroup, discover_clips, group_clips, group_part_index_gap_warning, group_summary
 
 
 class App:
@@ -139,11 +129,31 @@ class App:
         self.merge_all_btn.configure(state=merge_state)
         self.merge_selected_btn.configure(state=merge_state)
 
-    def _gap_threshold(self) -> float:
-        try:
-            return float(self.gap_var.get())
-        except ValueError:
+    def _gap_threshold(self) -> float | None:
+        """Returns the parsed gap-threshold value, or None if the current
+        text field content isn't usable -- callers must check for None
+        and abort rather than silently substituting a default the user
+        never asked for.
+
+        Empty string is treated as "use the default" -- a legitimate,
+        common case, since the field starts pre-filled with the default
+        and clearing it plausibly means "put it back." A non-empty value
+        that fails to parse, or parses to a non-positive number, used to
+        collapse to that same default silently -- a typo and a blank
+        field were indistinguishable to the user. Now reported as an
+        error instead."""
+        raw = self.gap_var.get().strip()
+        if not raw:
             return GAP_THRESHOLD_DEFAULT_S
+        try:
+            value = float(raw)
+        except ValueError:
+            messagebox.showerror("dji-repack", f"Gap threshold must be a number, got: {raw!r}")
+            return None
+        if value <= 0:
+            messagebox.showerror("dji-repack", f"Gap threshold must be a positive number, got: {value}")
+            return None
+        return value
 
     def _source_dir(self) -> Path | None:
         raw = self.source_var.get().strip()
@@ -185,6 +195,8 @@ class App:
         if source_dir is None:
             return
         gap_threshold = self._gap_threshold()
+        if gap_threshold is None:
+            return
         self._set_busy(True)
         self._log(f"scanning {source_dir} ...")
         threading.Thread(target=self._scan_worker, args=(source_dir, gap_threshold), daemon=True).start()
@@ -193,8 +205,8 @@ class App:
         try:
             clips, warnings = discover_clips(source_dir)
             groups = group_clips(clips, gap_threshold_s=gap_threshold)
-            stills = discover_stills(source_dir)
-            self.queue.put(("scan_done", groups, warnings, len(stills)))
+            stills, still_warnings = discover_stills(source_dir)
+            self.queue.put(("scan_done", groups, warnings + still_warnings, len(stills)))
         except Exception as e:  # noqa: BLE001 -- surfaced to the log, not swallowed
             self.queue.put(("error", str(e)))
 
@@ -230,57 +242,16 @@ class App:
         self, groups: list[ClipGroup], source_dir: Path, dest_dir: Path, do_archive: bool, do_stills: bool,
     ) -> None:
         try:
-            swept = sweep_stale_partials(dest_dir)
-            for name in swept:
-                self.queue.put(("log", f"removed leftover partial: {name}"))
-
-            for group in groups:
-                if len(group.clips) < 2:
-                    clip = group.clips[0]
-                    start = time.perf_counter()
-                    copy_warnings = copy_lone_clip(clip, dest_dir)
-                    elapsed = time.perf_counter() - start
-                    for w in copy_warnings:
-                        self.queue.put(("log", f"warning: {w}"))
-                    self.queue.put((
-                        "log", f"copied single clip -> {dest_dir / clip.mp4_path.name} ({elapsed:.1f}s)",
-                    ))
-                    self.queue.put(("merged_group", group))
-                    continue
-
-                gap_warning = group_part_index_gap_warning(group)
-                if gap_warning:
-                    self.queue.put(("log", f"warning: {gap_warning}"))
-
-                start = time.perf_counter()
-                result = merge_group(group, dest_dir=dest_dir)
-                elapsed = time.perf_counter() - start
-                for w in result.warnings:
-                    self.queue.put(("log", f"warning: {w}"))
-                if not result.ok:
-                    self.queue.put((
-                        "log", f"FAILED: {', '.join(result.source_files)} -- {result.error} ({elapsed:.1f}s)",
-                    ))
-                    continue
-
-                self.queue.put(("log", f"merged -> {result.output_path} ({elapsed:.1f}s)"))
-                if do_archive:
-                    for w in archive_merged_group(group, dest_dir):
-                        self.queue.put(("log", f"warning: {w}"))
-                self.queue.put(("merged_group", group))
-
-            if do_stills:
-                stills = discover_stills(source_dir)
-                copied, skipped, still_warnings = copy_stills(
-                    stills, dest_dir,
-                    on_progress=lambda name, elapsed: self.queue.put(
-                        ("log", f"  {name}: copied ({elapsed:.2f}s)"),
-                    ),
-                )
-                for w in still_warnings:
-                    self.queue.put(("log", f"warning: {w}"))
-                self.queue.put(("log", f"stills: {copied} copied, {skipped} already present"))
-
+            run_merge_pipeline(
+                groups, source_dir, dest_dir,
+                do_archive=do_archive,
+                do_stills=do_stills,
+                log=lambda message, stderr=False: self.queue.put(("log", message)),
+                on_group_done=lambda group: self.queue.put(("merged_group", group)),
+                on_still_progress=lambda name, elapsed: self.queue.put(
+                    ("log", f"  {name}: copied ({elapsed:.2f}s)"),
+                ),
+            )
             self.queue.put(("merge_done", None))
         except Exception as e:  # noqa: BLE001 -- surfaced to the log, not swallowed
             self.queue.put(("error", str(e)))
@@ -325,6 +296,8 @@ class App:
                 warnings.append("single clip, will be copied as-is")
             if summary["missing_srt"]:
                 warnings.append(f"missing SRT: {', '.join(summary['missing_srt'])}")
+            if summary["size_unavailable"]:
+                warnings.append("some clip sizes unavailable")
             gap_warning = group_part_index_gap_warning(group)
             if gap_warning:
                 warnings.append(gap_warning)

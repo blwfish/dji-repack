@@ -26,7 +26,7 @@ def count_skipped(warnings: list[str]) -> int:
     return sum(1 for w in warnings if _SKIPPED_MARKER in w)
 
 
-def sweep_stale_partials(dest_dir: Path) -> list[str]:
+def sweep_stale_partials(dest_dir: Path) -> tuple[list[str], list[str]]:
     """Remove any leftover `.{stem}.partial{suffix}` temp file directly
     under dest_dir -- merge_group() only ever cleans these up inside a
     caught `except RuntimeError`, so a SIGKILL, OOM kill, or native ffmpeg
@@ -34,17 +34,25 @@ def sweep_stale_partials(dest_dir: Path) -> list[str]:
     a large truncated intermediate) with nothing to remove it otherwise.
     Unambiguous to sweep: this dot-prefixed ".partial" naming is generated
     only by this package, never a device-originated file, so there's no
-    risk of this touching real source footage. Returns the names removed,
-    for the caller to fold into its own warnings."""
+    risk of this touching real source footage.
+
+    Returns (names removed, failure messages). A failed unlink (permission
+    error, file vanished mid-sweep) used to be swallowed by a bare `except
+    OSError: pass` with no record anywhere -- the caller had no way to
+    know cleanup silently failed for a given `.partial` file. Now it's
+    folded into the second list the same way every other per-item failure
+    in this package is surfaced, for the caller to fold into its own
+    warnings."""
     removed = []
+    failures = []
     for path in Path(dest_dir).glob(".*.partial*"):
         if path.is_file():
             try:
                 path.unlink()
                 removed.append(path.name)
-            except OSError:
-                pass
-    return removed
+            except OSError as e:
+                failures.append(f"{path.name}: failed to remove stale partial -- {e}")
+    return removed, failures
 
 
 def run(cmd: list[str], warnings: list[str] | None = None, timeout: float | None = 300) -> str:

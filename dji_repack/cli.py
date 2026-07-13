@@ -5,20 +5,11 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-import time
 from pathlib import Path
 
-from .archive import archive_merged_group, copy_lone_clip
-from .procs import sweep_stale_partials
-from .stills import copy_stills, discover_stills
-from .video import (
-    GAP_THRESHOLD_DEFAULT_S,
-    discover_clips,
-    group_clips,
-    group_part_index_gap_warning,
-    group_summary,
-    merge_group,
-)
+from .pipeline import run_merge_pipeline
+from .stills import discover_stills
+from .video import GAP_THRESHOLD_DEFAULT_S, discover_clips, group_clips, group_part_index_gap_warning, group_summary
 
 
 def _check_ffmpeg() -> None:
@@ -43,8 +34,9 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             summary = group_summary(group)
             kind = "multi-clip, will merge" if summary["clip_count"] > 1 else "single clip, will be copied as-is"
             print(f"group {i}: {summary['clip_count']} clip(s), {kind}")
+            size_note = " (some sizes unavailable)" if summary["size_unavailable"] else ""
             print(f"  start: {summary['start_dt']}  duration: {summary['total_duration_s']:.1f}s"
-                  f"  size: {summary['total_size_bytes'] / 1e6:.1f} MB")
+                  f"  size: {summary['total_size_bytes'] / 1e6:.1f} MB{size_note}")
             for name in summary["clip_names"]:
                 print(f"    {name}")
             if summary["missing_srt"]:
@@ -54,7 +46,9 @@ def _cmd_scan(args: argparse.Namespace) -> int:
                 print(f"  warning: {gap_warning}")
 
     if not args.no_stills:
-        stills = discover_stills(source_dir)
+        stills, still_warnings = discover_stills(source_dir)
+        for w in still_warnings:
+            print(f"warning: {w}", file=sys.stderr)
         print(f"{len(stills)} still image(s) found (.dng/.jpg/.jpeg)")
 
     return 0
@@ -65,68 +59,35 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     source_dir = Path(args.source_dir)
     dest_dir = Path(args.dest) if args.dest else source_dir
 
-    swept = sweep_stale_partials(dest_dir)
-    for name in swept:
-        print(f"removed leftover partial: {name}")
-
     clips, warnings = discover_clips(source_dir)
     for w in warnings:
         print(f"warning: {w}", file=sys.stderr)
 
-    merged = 0
-    copied_lone = 0
-    failed = 0
-
     if not clips:
         print("no video clips found")
+        groups = []
     else:
         groups = group_clips(clips, gap_threshold_s=args.gap_threshold)
-        for i, group in enumerate(groups, 1):
-            if len(group.clips) < 2:
-                clip = group.clips[0]
-                start = time.perf_counter()
-                copy_warnings = copy_lone_clip(clip, dest_dir)
-                elapsed = time.perf_counter() - start
-                for w in copy_warnings:
-                    print(f"warning: {w}", file=sys.stderr)
-                print(f"group {i}: single clip, copied -> {dest_dir / clip.mp4_path.name} ({elapsed:.1f}s)")
-                copied_lone += 1
-                continue
 
-            gap_warning = group_part_index_gap_warning(group)
-            if gap_warning:
-                print(f"warning: {gap_warning}", file=sys.stderr)
+    def log(message: str, stderr: bool) -> None:
+        print(message, file=sys.stderr if stderr else sys.stdout)
 
-            start = time.perf_counter()
-            result = merge_group(group, dest_dir=dest_dir)
-            elapsed = time.perf_counter() - start
-            for w in result.warnings:
-                print(f"warning: {w}", file=sys.stderr)
-            if not result.ok:
-                print(f"group {i}: FAILED -- {result.error} ({elapsed:.1f}s)", file=sys.stderr)
-                failed += 1
-                continue
+    result = run_merge_pipeline(
+        groups, source_dir, dest_dir,
+        do_archive=not args.no_archive,
+        do_stills=not args.no_stills,
+        log=log,
+        on_still_progress=lambda name, elapsed: print(f"  {name}: copied ({elapsed:.2f}s)"),
+    )
 
-            print(f"group {i}: merged -> {result.output_path} ({elapsed:.1f}s)")
-            merged += 1
-            if not args.no_archive:
-                for w in archive_merged_group(group, dest_dir):
-                    print(f"warning: {w}", file=sys.stderr)
-
-    copied_stills = skipped_stills = 0
+    summary = (
+        f"done: {result.merged_count} merged, {result.copied_lone_count} single clip(s) copied, "
+        f"{result.failed_count} failed"
+    )
     if not args.no_stills:
-        stills = discover_stills(source_dir)
-        copied_stills, skipped_stills, still_warnings = copy_stills(
-            stills, dest_dir, on_progress=lambda name, elapsed: print(f"  {name}: copied ({elapsed:.2f}s)"),
-        )
-        for w in still_warnings:
-            print(f"warning: {w}", file=sys.stderr)
-
-    summary = f"done: {merged} merged, {copied_lone} single clip(s) copied, {failed} failed"
-    if not args.no_stills:
-        summary += f", {copied_stills} still(s) copied ({skipped_stills} already present)"
+        summary += f", {result.stills_copied} still(s) copied ({result.stills_skipped} already present)"
     print(summary)
-    return 1 if failed else 0
+    return 1 if result.failed_count else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

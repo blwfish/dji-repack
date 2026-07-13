@@ -41,6 +41,31 @@ def _make_test_mp4(path: Path, duration_s: float = 1.0, size="320x240", rate=30)
     )
 
 
+def _make_rotated_test_mp4(path: Path, rotation: int, duration_s: float = 1.0):
+    """A plain lavfi-generated clip remuxed with a real Display Matrix
+    rotation side_data entry, via ffmpeg's -display_rotation input option
+    (see video.py's merge_group -- this is the same mechanism the CRITICAL
+    fix relies on to make rotation survive a concat-demuxer stream copy).
+    Setting rotate metadata directly at encode time (`-metadata:s:v:0
+    rotate=...`) was confirmed NOT to produce any side_data/tag at all on
+    this ffmpeg version's mov/mp4 muxer -- only the remux-with-
+    -display_rotation-as-input-option path actually writes it, which is
+    exactly why merge_group's old output-side -metadata approach was a
+    silent no-op."""
+    plain = path.with_name(f".{path.stem}.plain.mp4")
+    _make_test_mp4(plain, duration_s=duration_s)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-display_rotation", str(rotation), "-i", str(plain),
+            "-c:v", "copy", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    plain.unlink()
+
+
 def _make_test_mp4_with_audio(path: Path, duration_s: float = 1.0, size="320x240", rate=30):
     """Same as _make_test_mp4, but with a camera-mic-style AAC audio track
     -- exercises the audio probe/preserve-through-merge path, which a
@@ -292,3 +317,101 @@ class TestRealVideoProbeAndMerge:
         assert result.ok, result.error
         merged_probe = video.probe_clip(result.output_path)
         assert merged_probe.duration_s == pytest.approx(3.0, abs=0.3)
+
+    def test_merge_group_preserves_rotation_through_a_real_concat(self, tmp_path):
+        """The CRITICAL regression, exercised end to end against real
+        ffmpeg: merge_group used to set rotation via an output-side
+        `-metadata:s:v:0 rotate=...` on a stream-copy mux, which is a
+        silent no-op on this ffmpeg version's mov/mp4 muxer -- a merge of
+        rotated (e.g. portrait-mode) source clips reported ok=True with
+        no warnings while the output silently lost all orientation
+        metadata. Fixed via `-display_rotation` as a per-input option
+        (verified directly against this machine's ffmpeg before the fix
+        was written); the merged output must now carry a real Display
+        Matrix side_data entry with the correct rotation."""
+        from datetime import datetime, timedelta
+
+        a_path, b_path = tmp_path / "a.mp4", tmp_path / "b.mp4"
+        _make_rotated_test_mp4(a_path, rotation=90, duration_s=1.0)
+        _make_rotated_test_mp4(b_path, rotation=90, duration_s=1.0)
+
+        probe_a, probe_b = video.probe_clip(a_path), video.probe_clip(b_path)
+        assert probe_a.rotation == 90  # sanity: the fixture itself carries the tag
+
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        clip_a = video.Clip(
+            mp4_path=a_path, srt_path=None, cues=[], srt_error="no .SRT sidecar found",
+            probe=probe_a, start_dt=base, end_dt=base + timedelta(seconds=probe_a.duration_s),
+            start_is_estimated=True,
+        )
+        clip_b = video.Clip(
+            mp4_path=b_path, srt_path=None, cues=[], srt_error="no .SRT sidecar found",
+            probe=probe_b, start_dt=clip_a.end_dt,
+            end_dt=clip_a.end_dt + timedelta(seconds=probe_b.duration_s),
+            start_is_estimated=True,
+        )
+        group = video.ClipGroup(clips=[clip_a, clip_b])
+
+        result = video.merge_group(group, tmp_path / "out")
+
+        assert result.ok, result.error
+        merged_probe = video.probe_clip(result.output_path)
+        assert merged_probe.rotation == 90
+
+    def test_merge_group_preserves_negative_rotation(self, tmp_path):
+        """Companion boundary case: DJI's own rotation values can be
+        negative (e.g. -90 for the opposite portrait orientation) -- the
+        sign must survive too, not just the magnitude."""
+        from datetime import datetime, timedelta
+
+        a_path, b_path = tmp_path / "a.mp4", tmp_path / "b.mp4"
+        _make_rotated_test_mp4(a_path, rotation=-90, duration_s=1.0)
+        _make_rotated_test_mp4(b_path, rotation=-90, duration_s=1.0)
+
+        probe_a, probe_b = video.probe_clip(a_path), video.probe_clip(b_path)
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        clip_a = video.Clip(
+            mp4_path=a_path, srt_path=None, cues=[], srt_error="no .SRT sidecar found",
+            probe=probe_a, start_dt=base, end_dt=base + timedelta(seconds=probe_a.duration_s),
+            start_is_estimated=True,
+        )
+        clip_b = video.Clip(
+            mp4_path=b_path, srt_path=None, cues=[], srt_error="no .SRT sidecar found",
+            probe=probe_b, start_dt=clip_a.end_dt,
+            end_dt=clip_a.end_dt + timedelta(seconds=probe_b.duration_s),
+            start_is_estimated=True,
+        )
+        group = video.ClipGroup(clips=[clip_a, clip_b])
+
+        result = video.merge_group(group, tmp_path / "out")
+
+        assert result.ok, result.error
+        merged_probe = video.probe_clip(result.output_path)
+        assert merged_probe.rotation == -90
+
+    def test_merge_group_no_rotation_metadata_when_source_has_none(self, tmp_path):
+        """Companion to the two tests above: an unrotated group must not
+        gain a spurious -display_rotation argument (and thus a spurious
+        Display Matrix entry) it never had."""
+        a_path, b_path = tmp_path / "a.mp4", tmp_path / "b.mp4"
+        _make_test_mp4(a_path, duration_s=1.0)
+        _make_test_mp4(b_path, duration_s=1.0)
+
+        from datetime import datetime, timedelta
+
+        probe_a, probe_b = video.probe_clip(a_path), video.probe_clip(b_path)
+        assert probe_a.rotation == 0
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        clip_a = video.Clip(mp4_path=a_path, srt_path=None, cues=[], srt_error=None,
+                             probe=probe_a, start_dt=base,
+                             end_dt=base + timedelta(seconds=probe_a.duration_s), start_is_estimated=True)
+        clip_b = video.Clip(mp4_path=b_path, srt_path=None, cues=[], srt_error=None,
+                             probe=probe_b, start_dt=clip_a.end_dt,
+                             end_dt=clip_a.end_dt + timedelta(seconds=probe_b.duration_s), start_is_estimated=True)
+        group = video.ClipGroup(clips=[clip_a, clip_b])
+
+        result = video.merge_group(group, tmp_path / "out")
+
+        assert result.ok, result.error
+        merged_probe = video.probe_clip(result.output_path)
+        assert merged_probe.rotation == 0

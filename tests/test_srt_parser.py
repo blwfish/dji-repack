@@ -123,6 +123,20 @@ class TestMalformedBlocks:
         with pytest.raises(SrtParseError):
             parse_srt(write_srt(tmp_path, text))
 
+    def test_exactly_one_below_the_five_line_threshold_raises(self, tmp_path):
+        """The LOW gap: the test above exercises a much-shorter 3-line
+        block, not the immediate one-below-threshold case for `len(lines)
+        < 5` -- pin the boundary itself with a 4-line block (index,
+        timecode, header, datetime -- missing only the fields line)."""
+        text = (
+            "1\n"
+            "00:00:00,000 --> 00:00:00,033\n"
+            '<font size="28">FrameCnt: 1, DiffTime: 33ms\n'
+            "2026-06-29 10:27:07.249\n"
+        )
+        with pytest.raises(SrtParseError, match="expected >=5 lines, got 4"):
+            parse_srt(write_srt(tmp_path, text))
+
     def test_non_numeric_cue_index_raises(self, tmp_path):
         text = cue_block().replace("1\n00:00:00,000", "not_a_number\n00:00:00,000", 1)
         with pytest.raises(SrtParseError):
@@ -275,3 +289,30 @@ class TestTimecodeBoundaries:
     def test_one_hour_boundary(self, tmp_path):
         c = parse_srt(write_srt(tmp_path, cue_block(start_tc="01:00:00,000", end_tc="01:00:00,033")))[0]
         assert c.cue_start_s == 3600.0
+
+
+class TestFmtTcNegativeClamp:
+    """The MEDIUM gap: fmt_tc's `max(0, round(s * 1000))` clamp had no
+    test for a negative `s` input -- every existing boundary test in
+    TestFormatCueBlockRoundtrip only exercises the positive-rollover
+    cascade."""
+
+    def test_negative_seconds_clamped_to_zero(self, tmp_path):
+        original = parse_srt(write_srt(tmp_path, cue_block(), name="orig.SRT"))[0]
+        formatted = format_cue_block(1, -5.0, -1.0, original)
+        first_line_after_index = formatted.splitlines()[1]
+        assert first_line_after_index.startswith("00:00:00,000")
+
+
+class TestCueIndexNotCrossCheckedAgainstFrameCnt:
+    """LOW inventory finding: the block's own leading sequential index is
+    validated as well-formed then intentionally discarded (see
+    srt_parser.py's comment at the int(lines[0]) call) rather than
+    silently unlabeled -- it is never cross-checked against FrameCnt, so
+    a mismatch between the two does not raise."""
+
+    def test_index_diverging_from_framecnt_does_not_raise(self, tmp_path):
+        text = cue_block(index=99, framecnt=1)  # index and framecnt disagree
+        cues = parse_srt(write_srt(tmp_path, text))
+        assert len(cues) == 1
+        assert cues[0].framecnt == 1  # framecnt is what's actually stored/used

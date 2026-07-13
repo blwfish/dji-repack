@@ -10,6 +10,7 @@ cheaply.
 Ported from mneme's tests/test_repack_video.py.
 """
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -47,7 +48,8 @@ def make_cue(wall_clock, has_gps=True, **overrides):
     return SrtCue(**fields)
 
 
-def make_clip(mp4_path, start_dt, end_dt, cues=None, probe=None, srt_error=None, part_index=None):
+def make_clip(mp4_path, start_dt, end_dt, cues=None, probe=None, srt_error=None, part_index=None,
+              filename_suffix=None):
     cues = cues or []
     return video.Clip(
         mp4_path=Path(mp4_path),
@@ -59,6 +61,7 @@ def make_clip(mp4_path, start_dt, end_dt, cues=None, probe=None, srt_error=None,
         end_dt=end_dt,
         start_is_estimated=not bool(cues),
         part_index=part_index,
+        filename_suffix=filename_suffix,
     )
 
 
@@ -317,6 +320,26 @@ class TestGroupSummary:
         assert summary["clip_names"] == ["DJI_0001.MP4"]
         assert summary["clip_paths"] == [str(nested / "DJI_0001.MP4")]
 
+    def test_missing_file_size_degrades_instead_of_crashing(self, tmp_path):
+        """The MEDIUM regression: total_size = sum(c.mp4_path.stat().st_size
+        ...) was unguarded against OSError, unlike every other filesystem
+        touch in this codebase -- group_summary can run well after
+        discovery completed (e.g. the GUI calls it again on tree-selection/
+        populate), so a file removed/ejected/renamed in that window used
+        to crash the whole call instead of degrading."""
+        present = self._real_file(tmp_path, "a.mp4", size=100)
+        missing = tmp_path / "b.mp4"  # never created -- stat() raises
+        a = make_clip(present, BASE, BASE + timedelta(seconds=10), probe=make_probe(duration_s=10.0))
+        b = make_clip(missing, BASE, BASE + timedelta(seconds=10), probe=make_probe(duration_s=10.0))
+        summary = video.group_summary(video.ClipGroup(clips=[a, b]))
+        assert summary["total_size_bytes"] == 100
+        assert summary["size_unavailable"] is True
+
+    def test_size_unavailable_false_when_all_present(self, tmp_path):
+        a = make_clip(self._real_file(tmp_path, "a.mp4", size=100), BASE, BASE + timedelta(seconds=10))
+        summary = video.group_summary(video.ClipGroup(clips=[a]))
+        assert summary["size_unavailable"] is False
+
 
 class TestRequiredStreamField:
     """The HIGH regression: ffprobe's own "N/A" sentinel (distinct from
@@ -356,6 +379,101 @@ class TestStreamRotation:
             "tags": {"rotate": "270"},
         }
         assert video._stream_rotation(stream) == 90
+
+
+class TestProbeClipMalformedFfprobeOutput:
+    """The HIGH gap: probe_clip's own malformed-JSON error paths (no
+    video stream at all; no container duration) were never exercised by
+    any test -- the rest of this file only unit-tests the extracted
+    helpers (_required_stream_field/_stream_rotation) in isolation, and
+    test_integration.py's real-ffprobe tests never produce malformed
+    JSON."""
+
+    def test_no_streams_raises_runtime_error(self, monkeypatch):
+        def fake_run(cmd, warnings):
+            if "-show_format" in cmd:
+                return json.dumps({"streams": [], "format": {"duration": "1.0"}})
+            return json.dumps({"streams": []})  # audio probe call
+
+        monkeypatch.setattr(video, "_run", fake_run)
+        with pytest.raises(RuntimeError, match="no video stream"):
+            video.probe_clip(Path("/fake/a.mp4"))
+
+    def test_missing_container_duration_raises_runtime_error(self, monkeypatch):
+        def fake_run(cmd, warnings):
+            if "-show_format" in cmd:
+                return json.dumps({
+                    "streams": [{
+                        "codec_name": "h264", "width": "1920", "height": "1080",
+                        "r_frame_rate": "30/1", "pix_fmt": "yuv420p",
+                    }],
+                    "format": {},
+                })
+            return json.dumps({"streams": []})  # audio probe call
+
+        monkeypatch.setattr(video, "_run", fake_run)
+        with pytest.raises(RuntimeError, match="no container duration"):
+            video.probe_clip(Path("/fake/a.mp4"))
+
+
+class TestProbeClipFieldFallbacks:
+    """The MEDIUM gap: bit_rate's stream-then-format `or` chain and
+    container_location's location-tag-then-Apple-ISO6709 `or` chain had
+    no test pinning their precedence or the falsy-vs-missing ambiguity."""
+
+    def _fake_json(self, stream_overrides=None, fmt_overrides=None):
+        stream = dict(codec_name="h264", width="1920", height="1080",
+                      r_frame_rate="30/1", pix_fmt="yuv420p")
+        stream.update(stream_overrides or {})
+        fmt = dict(duration="1.0", tags={})
+        fmt.update(fmt_overrides or {})
+        return json.dumps({"streams": [stream], "format": fmt})
+
+    def _probe_with(self, monkeypatch, stream_overrides=None, fmt_overrides=None):
+        def fake_run(cmd, warnings):
+            if "-show_format" in cmd:
+                return self._fake_json(stream_overrides, fmt_overrides)
+            return json.dumps({"streams": []})  # audio probe call
+
+        monkeypatch.setattr(video, "_run", fake_run)
+        return video.probe_clip(Path("/fake/a.mp4"))
+
+    def test_bit_rate_prefers_stream_over_format(self, monkeypatch):
+        probe = self._probe_with(
+            monkeypatch,
+            stream_overrides={"bit_rate": "5000000"},
+            fmt_overrides={"bit_rate": "9999999"},
+        )
+        assert probe.bit_rate == 5000000
+
+    def test_bit_rate_falls_back_to_format_when_stream_missing(self, monkeypatch):
+        probe = self._probe_with(monkeypatch, fmt_overrides={"bit_rate": "9999999"})
+        assert probe.bit_rate == 9999999
+
+    def test_container_location_prefers_location_tag_over_apple_iso6709(self, monkeypatch):
+        probe = self._probe_with(monkeypatch, fmt_overrides={"tags": {
+            "location": "+41.0-75.0/",
+            "com.apple.quicktime.location.ISO6709": "+99.0-99.0/",
+        }})
+        assert probe.container_location == "+41.0-75.0/"
+
+    def test_container_location_falls_back_to_apple_iso6709_when_location_tag_missing(self, monkeypatch):
+        probe = self._probe_with(monkeypatch, fmt_overrides={"tags": {
+            "com.apple.quicktime.location.ISO6709": "+99.0-99.0/",
+        }})
+        assert probe.container_location == "+99.0-99.0/"
+
+    def test_empty_string_location_tag_falls_through_to_apple_iso6709(self, monkeypatch):
+        """Pins the current falsy-vs-missing behavior: an empty-string
+        `location` tag is falsy in Python, so the `or` chain falls
+        through to the ISO6709 tag even though the primary key was
+        technically present (not absent). Documented here as the current
+        contract rather than left silently unverified."""
+        probe = self._probe_with(monkeypatch, fmt_overrides={"tags": {
+            "location": "",
+            "com.apple.quicktime.location.ISO6709": "+99.0-99.0/",
+        }})
+        assert probe.container_location == "+99.0-99.0/"
 
 
 class TestFilenameStart:
@@ -406,6 +524,48 @@ class TestFilenamePartIndex:
         assert video._filename_part_index(Path("IMG_1234.MP4")) is None
 
 
+class TestClipSortKey:
+    """The MEDIUM regression: two SRT-timed clips sharing an identical
+    wall-clock start second both have filename_suffix=None (it's only
+    ever populated on the cueless/filename-estimated path), so the old
+    two-element sort key `(start_dt, filename_suffix or "")` ties
+    completely and falls back to whatever order Python's stable sort
+    happened to preserve from the earlier path-lexicographic pass over
+    mp4_paths -- which worked, but was an unlabeled accident of sort
+    stability rather than an explicit, tested contract. The full source
+    path is now an explicit third key element."""
+
+    def test_same_start_dt_and_no_suffix_breaks_tie_on_path(self):
+        a = make_clip("/fake/z.mp4", BASE, BASE, cues=[make_cue(BASE)])
+        b = make_clip("/fake/a.mp4", BASE, BASE, cues=[make_cue(BASE)])
+        ordered = sorted([a, b], key=video._clip_sort_key)
+        assert [c.mp4_path.name for c in ordered] == ["a.mp4", "z.mp4"]
+
+    def test_filename_suffix_still_takes_precedence_over_path_tiebreak(self):
+        a = make_clip("/fake/z.mp4", BASE, BASE, filename_suffix="0002")
+        b = make_clip("/fake/a.mp4", BASE, BASE, filename_suffix="0001")
+        ordered = sorted([a, b], key=video._clip_sort_key)
+        # "0001" < "0002" wins even though it reverses path-lexicographic order
+        assert [c.mp4_path.name for c in ordered] == ["a.mp4", "z.mp4"]
+
+
+class TestDiscoverClipsSkipsOwnMergedOutput:
+    def test_merged_output_filename_is_not_rediscovered_as_source(self, tmp_path):
+        """The LOW regression: this tool's own merged-output filenames
+        (AIR3_*.mp4, see MERGED_OUTPUT_PREFIX) were previously excluded
+        from rediscovery only as an implicit side effect of
+        FILENAME_TS_RE requiring a "DJI_" prefix -- an undocumented,
+        untested coincidence between two independently-chosen filename
+        conventions, and one that still generated a noisy "ffprobe
+        failed" warning on this fixture's garbage bytes before falling
+        through to that implicit skip. Now an explicit, early check that
+        skips before ever attempting to probe it."""
+        (tmp_path / "AIR3_20260629_100000.mp4").write_bytes(b"x")
+        clips, warnings = video.discover_clips(tmp_path)
+        assert clips == []
+        assert not any("AIR3_20260629_100000.mp4" in w for w in warnings)
+
+
 class TestGroupPartIndexGapWarning:
     """The HIGH regression: group_clips() groups purely by wall-clock gap
     with no part-count check at all -- a middle segment that failed to
@@ -448,6 +608,27 @@ class TestGroupPartIndexGapWarning:
         a = make_clip("/fake/a.mp4", BASE, BASE + timedelta(seconds=60), part_index=1)
         group = video.ClipGroup(clips=[a])
         assert video.group_part_index_gap_warning(group) is None
+
+    def test_duplicate_part_index_returns_a_warning(self):
+        """The HIGH gap: a `!=` -> `>` mutant survives every pre-existing
+        test in this class unchanged, since none of them exercise a
+        duplicate (non-increasing) part index -- only a forward gap or
+        strictly consecutive/absent indices. `cur_idx > prev_idx + 1` is
+        False for a duplicate (2 > 3 is False), silently defeating the
+        missing-segment warning this function exists to raise."""
+        a = make_clip("/fake/DJI_x_0002.mp4", BASE, BASE + timedelta(seconds=60), part_index=2)
+        b = make_clip("/fake/DJI_x_0002_dup.mp4", BASE, BASE + timedelta(seconds=60), part_index=2)
+        group = video.ClipGroup(clips=[a, b])
+        assert video.group_part_index_gap_warning(group) is not None
+
+    def test_reversed_part_index_returns_a_warning(self):
+        """Same mutant, same gap: a reversed pair (5 -> 2) also passes
+        `> prev_idx + 1` as False (2 > 6 is False), so this case was
+        equally unpinned."""
+        a = make_clip("/fake/DJI_x_0005.mp4", BASE, BASE + timedelta(seconds=60), part_index=5)
+        b = make_clip("/fake/DJI_x_0002.mp4", BASE, BASE + timedelta(seconds=60), part_index=2)
+        group = video.ClipGroup(clips=[a, b])
+        assert video.group_part_index_gap_warning(group) is not None
 
 
 class TestMergeGroupFailureCleanup:

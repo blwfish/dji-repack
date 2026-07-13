@@ -115,6 +115,20 @@ def parse_srt(srt_path) -> list[SrtCue]:
             raise SrtParseError(srt_path, block, f"expected >=5 lines, got {len(lines)}")
 
         try:
+            # This leading per-block sequential index is DJI's own SRT
+            # cue counter; validated here only as "well-formed integer"
+            # and then intentionally discarded (dropped-with-reason, per
+            # this module's data-capture disposition convention -- see
+            # the module docstring, which scopes its own "none are
+            # silently dropped" claim to the bracket-fields line only,
+            # not this one): cue ordering and merge timing both come from
+            # the timecode line and cumulative_offset math in video.py,
+            # not from this counter, and it is never cross-checked
+            # against FrameCnt (parsed two lines below). A real
+            # divergence between the two -- a firmware or reordering
+            # glitch producing a skipped/duplicated cue index while
+            # FrameCnt keeps incrementing, or vice versa -- currently
+            # passes through unnoticed.
             int(lines[0].strip())
         except ValueError as e:
             raise SrtParseError(srt_path, block, f"bad cue index: {e}") from e
